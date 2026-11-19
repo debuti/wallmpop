@@ -52,7 +52,8 @@ HELP = """🛒 <b>wallmpop</b> — cazador de chollos en Wallapop
 /estado — salud de la API y consumo de hoy
 /usuarios — (admin) quién puede usar el bot
 
-🎯 = encaja (suena) · 🤔 = quizá (silencioso)"""
+🎯 = encaja (suena) · 🤔 = quizá (silencioso)
+👍/👎 = guardar tu opinión para /afinar · ✓ Visto = quitar botones sin guardar nada"""
 
 
 def pre(text: str) -> str:
@@ -153,7 +154,7 @@ class Bot:
                f"💶 {price}   📍 {html.escape(where)}\n💬 {html.escape(why)}")
         kb = KB([[B("👍", callback_data=f"fb:1:{alert_id}:{it.id}"), B("👎", callback_data=f"fb:0:{alert_id}:{it.id}"),
                   B("🔍 a fondo", callback_data=f"dp:{alert_id}:{it.id}"), B("🔕", callback_data=f"mu:{it.seller_id}")],
-                 [B("Abrir en Wallapop", url=it.url)]])
+                 [B("Abrir en Wallapop", url=it.url), B("✓ Visto", callback_data="vs")]])
         silent = verdict != "match"
         owner = self._owner(alert_id)
         for uid in [owner] if owner else []:
@@ -363,6 +364,13 @@ class Bot:
                 return
             self.db.add_feedback(int(parts[2]), parts[3], 1 if parts[1] == "1" else -1)
             await q.answer("Anotado " + ("👍" if parts[1] == "1" else "👎"))
+        elif kind == "vs":  # seen: drop the buttons, keep the link; nothing is stored
+            await q.answer("✓ Visto")
+            link = [b for row in (q.message.reply_markup.inline_keyboard if q.message.reply_markup else [])
+                    for b in row if b.url]
+            await q.edit_message_reply_markup(KB([link + [B("✓ visto", callback_data="x0")]]) if link else None)
+        elif kind == "x0":
+            await q.answer()
         elif kind == "mu":
             self.db.mute_seller(q.from_user.id, parts[1])
             await q.answer("🔕 Vendedor silenciado")
