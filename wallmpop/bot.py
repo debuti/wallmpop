@@ -53,7 +53,7 @@ HELP = """🛒 <b>wallmpop</b> — cazador de chollos en Wallapop
 /usuarios — (admin) quién puede usar el bot
 
 🎯 = encaja (suena) · 🤔 = quizá (silencioso)
-👍/👎 = guardar tu opinión para /afinar · ✓ Visto = quitar botones sin guardar nada"""
+👍/👎 = guardar tu opinión para /afinar · ✓ Visto = quitar botones sin guardar nada (púlsalo otra vez para deshacer)"""
 
 
 def pre(text: str) -> str:
@@ -152,9 +152,7 @@ class Bot:
         price = f"{it.price:g}€" + (f" (antes {old_price:g}€)" if old_price is not None else "")
         cap = (f"{head} · {html.escape(cfg.name)} · {score:g}/10\n<b>{html.escape(it.title)}</b>\n"
                f"💶 {price}   📍 {html.escape(where)}\n💬 {html.escape(why)}")
-        kb = KB([[B("👍", callback_data=f"fb:1:{alert_id}:{it.id}"), B("👎", callback_data=f"fb:0:{alert_id}:{it.id}"),
-                  B("🔍 a fondo", callback_data=f"dp:{alert_id}:{it.id}"), B("🔕", callback_data=f"mu:{it.seller_id}")],
-                 [B("Abrir en Wallapop", url=it.url), B("✓ Visto", callback_data="vs")]])
+        kb = self._listing_kb(alert_id, it.id, it.seller_id, it.url)
         silent = verdict != "match"
         owner = self._owner(alert_id)
         for uid in [owner] if owner else []:
@@ -170,6 +168,12 @@ class Bot:
                                                 disable_notification=silent, disable_web_page_preview=True)
             except TelegramError:
                 log.exception("send listing")
+
+    @staticmethod
+    def _listing_kb(alert_id: int, item_id: str, seller_id: str, url: str) -> KB:
+        return KB([[B("👍", callback_data=f"fb:1:{alert_id}:{item_id}"), B("👎", callback_data=f"fb:0:{alert_id}:{item_id}"),
+                    B("🔍 a fondo", callback_data=f"dp:{alert_id}:{item_id}"), B("🔕", callback_data=f"mu:{seller_id}")],
+                   [B("Abrir en Wallapop", url=url), B("✓ Visto", callback_data=f"vs:{alert_id}:{item_id}")]])
 
     # ---------- helpers ----------
     def _alert(self, ref: str, uid: int):
@@ -368,7 +372,15 @@ class Bot:
             await q.answer("✓ Visto")
             link = [b for row in (q.message.reply_markup.inline_keyboard if q.message.reply_markup else [])
                     for b in row if b.url]
-            await q.edit_message_reply_markup(KB([link + [B("✓ visto", callback_data="x0")]]) if link else None)
+            undo = "x0" if len(parts) < 3 else f"uv:{parts[1]}:{parts[2]}"
+            await q.edit_message_reply_markup(KB([link + [B("✓ visto", callback_data=undo)]]) if link else None)
+        elif kind == "uv":  # undo seen: bring the buttons back
+            row = self.db.listing(int(parts[1]), parts[2])
+            if not row or self._owner(int(parts[1])) != q.from_user.id:
+                await q.answer("Ya no tengo ese anuncio.")
+                return
+            await q.answer("Visto deshecho")
+            await q.edit_message_reply_markup(self._listing_kb(int(parts[1]), parts[2], row["seller_id"], row["url"]))
         elif kind == "x0":
             await q.answer()
         elif kind == "mu":
