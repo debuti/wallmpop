@@ -38,6 +38,7 @@ COMMANDS = [
     ("afinar", "Ajustar con tus 👍/👎"),
     ("estado", "Salud de la API y consumo de hoy"),
     ("ayuda", "Ayuda"),
+    ("usuarios", "Solo admin: quién puede usar el bot"),
 ]
 
 HELP = """🛒 <b>wallmpop</b> — cazador de chollos en Wallapop
@@ -49,6 +50,7 @@ HELP = """🛒 <b>wallmpop</b> — cazador de chollos en Wallapop
 /pausar · /reanudar · /baja <i>n</i>
 /afinar <i>n</i> — ajusta la alerta con tus 👍/👎
 /estado — salud de la API y consumo de hoy
+/usuarios — (admin) quién puede usar el bot
 
 🎯 = encaja (suena) · 🤔 = quizá (silencioso)"""
 
@@ -76,22 +78,63 @@ class Bot:
         self.drafts: dict[str, dict[str, Any]] = {}
 
     # ---------- access control ----------
+    @property
+    def admins(self) -> set[int]:
+        return self.s.allowed_user_ids
+
+    def is_admin(self, uid: int) -> bool:
+        return uid in self.admins
+
+    def allowed(self, uid: int) -> bool:
+        if self.is_admin(uid):
+            return True
+        row = self.db.user(uid)
+        return bool(row and row["status"] == "allowed")
+
     async def gate(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         user = update.effective_user
-        if user and user.id in self.s.allowed_user_ids:
+        if user and self.allowed(user.id):
             return
-        log.warning("denied update from user %s (%s)", user.id if user else None,
-                    user.username if user else None)
-        if not self.s.allowed_user_ids and update.effective_message and user:
-            await update.effective_message.reply_text(
-                f"Bot sin configurar. Tu id es {user.id}: ponlo en ALLOWED_USER_IDS y reinicia.")
-        if update.callback_query:
-            await update.callback_query.answer()
+        q = update.callback_query
+        if q:
+            await q.answer()
+        msg = update.effective_message
+        if not user or not msg or q:
+            raise ApplicationHandlerStop
+        if not self.admins:
+            await msg.reply_text(f"Bot sin configurar. Tu id es {user.id}: ponlo en ALLOWED_USER_IDS y reinicia.")
+            raise ApplicationHandlerStop
+        row = self.db.user(user.id)
+        if row is None:  # first contact: ask the admins, once
+            name = user.full_name or str(user.id)
+            self.db.set_user(user.id, "pending", name, user.username)
+            log.warning("access request from %s (%s, @%s)", user.id, name, user.username)
+            who = html.escape(name) + (f" (@{html.escape(user.username)})" if user.username else "")
+            kb = KB([[B("✅ Permitir", callback_data=f"au:1:{user.id}"), B("❌ Rechazar", callback_data=f"au:0:{user.id}")]])
+            for uid in self.admins:
+                try:
+                    await self.app.bot.send_message(
+                        uid, f"👤 {who}, id {user.id}, quiere usar el bot.\nEscribió: {html.escape((msg.text or '')[:200])}",
+                        parse_mode=ParseMode.HTML, reply_markup=kb)
+                except TelegramError:
+                    log.exception("notify admin")
+            await msg.reply_text("Este bot es privado. He pedido permiso al administrador; te aviso si te deja pasar.")
+        elif row["status"] == "pending":
+            await msg.reply_text("Tu solicitud sigue pendiente del administrador.")
+        else:
+            log.info("ignored denied user %s", user.id)
         raise ApplicationHandlerStop
 
     # ---------- notifier (used by the scheduler) ----------
-    async def text(self, text: str) -> None:
-        for uid in self.s.allowed_user_ids:
+    def _owner(self, alert_id: int) -> int | None:
+        row = self.db.alert(alert_id)
+        return row["owner"] if row else None
+
+    async def text(self, text: str, alert_id: int | None = None) -> None:
+        targets = self.admins if alert_id is None else {self._owner(alert_id)} - {None}
+        if alert_id is None:  # developer notice: also tell the other users
+            targets = targets | {r["user_id"] for r in self.db.users() if r["status"] == "allowed"}
+        for uid in targets:
             try:
                 await self.app.bot.send_message(uid, text)
             except TelegramError:
@@ -112,7 +155,8 @@ class Bot:
                   B("🔍 a fondo", callback_data=f"dp:{alert_id}:{it.id}"), B("🔕", callback_data=f"mu:{it.seller_id}")],
                  [B("Abrir en Wallapop", url=it.url)]])
         silent = verdict != "match"
-        for uid in self.s.allowed_user_ids:
+        owner = self._owner(alert_id)
+        for uid in [owner] if owner else []:
             try:
                 if it.image:
                     await self.app.bot.send_photo(uid, it.image, caption=cap[:1024], parse_mode=ParseMode.HTML,
@@ -127,8 +171,8 @@ class Bot:
                 log.exception("send listing")
 
     # ---------- helpers ----------
-    def _alert(self, ref: str):
-        row = self.db.find_alert(ref) if ref else None
+    def _alert(self, ref: str, uid: int):
+        row = self.db.find_alert(ref, uid) if ref else None
         return row, (AlertConfig.from_dict(json.loads(row["config"])) if row else None)
 
     def _draft_kb(self, did: str, cfg: AlertConfig, ok_label: str) -> KB:
@@ -159,6 +203,11 @@ class Bot:
 
     async def cmd_alta(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         text = " ".join(ctx.args)
+        uid = update.effective_user.id
+        if not self.is_admin(uid) and len(self.db.alerts(owner=uid)) >= self.s.max_alerts_per_user:
+            await update.effective_message.reply_text(
+                f"Tienes {self.s.max_alerts_per_user} alertas, el máximo. Borra alguna con /baja.")
+            return
         if not text:
             await update.effective_message.reply_text("Dime qué buscas: /alta NVMe 512GB <50€ gen3+, Madrid")
             return
@@ -168,10 +217,10 @@ class Bot:
         except (LLMError, ValueError) as e:
             await msg.edit_text(f"No he podido montar la alerta: {e}")
             return
-        await self._show_draft(msg, {"mode": "new", "cfg": cfg})
+        await self._show_draft(msg, {"mode": "new", "cfg": cfg, "owner": uid})
 
     async def cmd_editar(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        row, cfg = self._alert(ctx.args[0] if ctx.args else "")
+        row, cfg = self._alert(ctx.args[0] if ctx.args else "", update.effective_user.id)
         if not row or len(ctx.args) < 2:
             await update.effective_message.reply_text("Uso: /editar <n> <cambio>. Mira los n con /lista")
             return
@@ -181,10 +230,10 @@ class Bot:
         except (LLMError, ValueError) as e:
             await msg.edit_text(f"No he podido aplicar el cambio: {e}")
             return
-        await self._show_draft(msg, {"mode": "edit", "id": row["id"], "old": cfg, "cfg": new})
+        await self._show_draft(msg, {"mode": "edit", "id": row["id"], "old": cfg, "cfg": new, "owner": update.effective_user.id})
 
     async def cmd_afinar(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        row, cfg = self._alert(ctx.args[0] if ctx.args else "")
+        row, cfg = self._alert(ctx.args[0] if ctx.args else "", update.effective_user.id)
         if not row:
             await update.effective_message.reply_text("Uso: /afinar <n>")
             return
@@ -199,10 +248,10 @@ class Bot:
         except (LLMError, ValueError) as e:
             await msg.edit_text(f"No he podido afinarla: {e}")
             return
-        await self._show_draft(msg, {"mode": "edit", "id": row["id"], "old": cfg, "cfg": new})
+        await self._show_draft(msg, {"mode": "edit", "id": row["id"], "old": cfg, "cfg": new, "owner": update.effective_user.id})
 
     async def cmd_frecuencia(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        row, cfg = self._alert(ctx.args[0] if ctx.args else "")
+        row, cfg = self._alert(ctx.args[0] if ctx.args else "", update.effective_user.id)
         if not row or len(ctx.args) < 2 or not ctx.args[1].isdigit():
             await update.effective_message.reply_text("Uso: /frecuencia <n> <minutos> (mínimo 5)")
             return
@@ -212,7 +261,7 @@ class Bot:
         await update.effective_message.reply_text(f"«{cfg.name}» mirará cada {cfg.interval_min} min.")
 
     async def _set_paused(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, paused: bool) -> None:
-        row, cfg = self._alert(ctx.args[0] if ctx.args else "")
+        row, cfg = self._alert(ctx.args[0] if ctx.args else "", update.effective_user.id)
         if not row:
             await update.effective_message.reply_text("¿Qué alerta? Mira los n con /lista")
             return
@@ -228,7 +277,7 @@ class Bot:
         await self._set_paused(update, ctx, False)
 
     async def cmd_baja(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        row, cfg = self._alert(ctx.args[0] if ctx.args else "")
+        row, cfg = self._alert(ctx.args[0] if ctx.args else "", update.effective_user.id)
         if not row:
             await update.effective_message.reply_text("¿Qué alerta? Mira los n con /lista")
             return
@@ -237,7 +286,7 @@ class Bot:
             reply_markup=KB([[B("🗑 Sí, borrar", callback_data=f"rm:{row['id']}"), B("Cancelar", callback_data="x")]]))
 
     async def cmd_lista(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        rows = self.db.alerts()
+        rows = self.db.alerts(owner=update.effective_user.id)
         if not rows:
             await update.effective_message.reply_text("Sin alertas. Crea una con /alta")
             return
@@ -264,8 +313,12 @@ class Bot:
                              f"· ~{u['cost']:.2f}$ equiv.")
         else:
             lines.append("Hoy: sin llamadas al modelo.")
-        lines.append(f"Tope global: {self.db.calls_today()}/{self.s.global_max_llm_per_day}")
-        for r in self.db.alerts():
+        uid = update.effective_user.id
+        if not self.is_admin(uid):
+            lines = lines[:2] + [f"Tus llamadas hoy: {self.db.calls_today_owner(uid)}"]
+        else:
+            lines.append(f"Tope global: {self.db.calls_today()}/{self.s.global_max_llm_per_day}")
+        for r in self.db.alerts(owner=uid):
             c = AlertConfig.from_dict(json.loads(r["config"]))
             lines.append(f"  {r['id']}. {c.name}: {self.db.calls_today(r['id'])}/{c.max_llm_per_day}")
         await update.effective_message.reply_text("\n".join(lines))
@@ -277,7 +330,7 @@ class Bot:
         kind = parts[0]
         if kind in ("fq", "ok", "no"):
             d = self.drafts.get(parts[1])
-            if not d:
+            if not d or d["owner"] != q.from_user.id:
                 await q.answer("Borrador caducado; repite la orden.")
                 return
             if kind == "fq":
@@ -294,7 +347,7 @@ class Bot:
                 return
             cfg = d["cfg"]
             if d["mode"] == "new":
-                aid = self.db.add_alert(cfg)
+                aid = self.db.add_alert(cfg, d["owner"])
                 text = f"✅ Alerta {aid} «{cfg.name}» creada; miro ya y luego cada {cfg.interval_min} min."
             else:
                 aid = d["id"]
@@ -305,24 +358,73 @@ class Bot:
             await q.edit_message_reply_markup(None)
             await q.message.reply_text(text)
         elif kind == "fb":
+            if self._owner(int(parts[2])) != q.from_user.id:
+                await q.answer()
+                return
             self.db.add_feedback(int(parts[2]), parts[3], 1 if parts[1] == "1" else -1)
             await q.answer("Anotado " + ("👍" if parts[1] == "1" else "👎"))
         elif kind == "mu":
-            self.db.mute_seller(parts[1])
+            self.db.mute_seller(q.from_user.id, parts[1])
             await q.answer("🔕 Vendedor silenciado")
         elif kind == "dp":
             await self._deep(q, int(parts[1]), parts[2])
         elif kind == "rm":
+            if self._owner(int(parts[1])) != q.from_user.id:
+                await q.answer()
+                return
             self.db.delete_alert(int(parts[1]))
             self.sched.next_run.pop(int(parts[1]), None)
             await q.answer("Borrada")
             await q.edit_message_text("🗑 Alerta borrada.")
+        elif kind in ("au", "ux"):
+            await self._user_button(q, parts)
         else:
             await q.answer()
             await q.edit_message_reply_markup(None)
 
+    # ---------- users (admin) ----------
+    async def _user_button(self, q, parts: list[str]) -> None:
+        if not self.is_admin(q.from_user.id):
+            await q.answer()
+            return
+        if parts[0] == "ux":  # revoke from /usuarios
+            uid, ok = int(parts[1]), False
+        else:
+            uid, ok = int(parts[2]), parts[1] == "1"
+        row = self.db.user(uid)
+        name = row["name"] if row else str(uid)
+        self.db.set_user(uid, "allowed" if ok else "denied")
+        if not ok:
+            self.db.pause_owner(uid)
+        await q.answer("Permitido" if ok else "Rechazado")
+        await q.edit_message_text(f"{'✅ Permitido' if ok else '🚫 Sin acceso'}: {name} ({uid})")
+        if ok:
+            try:
+                await self.app.bot.send_message(uid, "✅ El administrador te ha dado acceso.\n\n" + HELP,
+                                                parse_mode=ParseMode.HTML)
+            except TelegramError:
+                log.warning("could not greet %s", uid)
+
+    async def cmd_usuarios(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self.is_admin(update.effective_user.id):
+            return
+        rows = self.db.users()
+        if not rows:
+            await update.effective_message.reply_text("Nadie más ha pedido acceso.")
+            return
+        icon = {"allowed": "✅", "pending": "⏳", "denied": "🚫"}
+        for r in rows:
+            who = f"{icon.get(r['status'], '?')} {r['name']}" + (f" @{r['username']}" if r["username"] else "")
+            who += f" ({r['user_id']}) · {len(self.db.alerts(owner=r['user_id']))} alertas"
+            if r["status"] == "allowed":
+                kb = KB([[B("🚫 Quitar acceso", callback_data=f"ux:{r['user_id']}")]])
+            else:
+                kb = KB([[B("✅ Permitir", callback_data=f"au:1:{r['user_id']}"),
+                          B("❌ Rechazar", callback_data=f"au:0:{r['user_id']}")]])
+            await update.effective_message.reply_text(who, reply_markup=kb)
+
     async def _deep(self, q, alert_id: int, item_id: str) -> None:
-        row, cfg = self._alert(str(alert_id))
+        row, cfg = self._alert(str(alert_id), q.from_user.id)
         it = self.db.listing(alert_id, item_id)
         if not row or not it:
             await q.answer("Ya no tengo ese anuncio.")
@@ -340,10 +442,12 @@ class Bot:
     # ---------- wiring ----------
     def build(self, sched_factory) -> Application:
         async def post_init(app: Application) -> None:
+            if self.admins:
+                self.db.claim_unowned(min(self.admins))
             self.sched = sched_factory(self)
             self._loop_task = asyncio.create_task(self.sched.loop())
             await app.bot.set_my_commands([BotCommand(c, d) for c, d in COMMANDS])
-            log.info("bot ready; allowed users: %s", sorted(self.s.allowed_user_ids))
+            log.info("bot ready; admins: %s", sorted(self.admins))
 
         app = (Application.builder().token(self.s.telegram_token).concurrent_updates(True)
                .post_init(post_init).build())
@@ -353,7 +457,7 @@ class Bot:
                          ("alta", self.cmd_alta), ("editar", self.cmd_editar), ("afinar", self.cmd_afinar),
                          ("frecuencia", self.cmd_frecuencia), ("pausar", self.cmd_pausar),
                          ("reanudar", self.cmd_reanudar), ("baja", self.cmd_baja), ("lista", self.cmd_lista),
-                         ("estado", self.cmd_estado)]:
+                         ("estado", self.cmd_estado), ("usuarios", self.cmd_usuarios)]:
             app.add_handler(CommandHandler(name, fn))
         app.add_handler(CallbackQueryHandler(self.on_button))
         app.add_error_handler(self.on_error)

@@ -29,6 +29,7 @@ class Settings:
     default_interval_min: int = 15
     global_max_llm_per_day: int = 300
     tick_seconds: int = 30
+    max_alerts_per_user: int = 10
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -44,4 +45,5 @@ class Settings:
             default_lon=float(os.environ.get("DEFAULT_LON", "-3.7038")),
             default_interval_min=int(os.environ.get("DEFAULT_INTERVAL_MIN", "15")),
             global_max_llm_per_day=int(os.environ.get("GLOBAL_MAX_LLM_PER_DAY", "300")),
+            max_alerts_per_user=int(os.environ.get("MAX_ALERTS_PER_USER", "10")),
         )

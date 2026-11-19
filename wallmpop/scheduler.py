@@ -25,7 +25,8 @@ class Notifier(Protocol):
     async def listing(self, alert_id: int, cfg: AlertConfig, it: Listing, verdict: str, score: float,
                       why: str, old_price: float | None = None) -> None: ...
 
-    async def text(self, text: str) -> None: ...
+    async def text(self, text: str, alert_id: int | None = None) -> None:
+        """alert_id=None: developer notice for the admins; otherwise to the alert's owner."""
 
 
 class Scheduler:
@@ -36,6 +37,7 @@ class Scheduler:
         self.health = SourceHealth(source.name)
         self.next_run: dict[int, float] = {}
         self.cap_warned: set[tuple[str, int]] = set()
+        self.owner: dict[int, int | None] = {}
 
     def interval(self, cfg: AlertConfig) -> int:
         return max(5, cfg.interval_min or self.default_interval)
@@ -56,6 +58,7 @@ class Scheduler:
         ok_runs, total = 0, 0
         for row in self.db.alerts(include_paused=False):
             cfg = AlertConfig.from_dict(json.loads(row["config"]))
+            self.owner[row["id"]] = row["owner"]
             due = self.next_run.get(row["id"], row["last_run"] + self.interval(cfg) * 60)
             if now < due:
                 continue
@@ -89,7 +92,10 @@ class Scheduler:
         return len(items)
 
     async def process(self, alert_id: int, cfg: AlertConfig, items: list[Listing]) -> None:
-        muted = self.db.muted_sellers()
+        owner = self.owner.get(alert_id)
+        if owner is None and (row := self.db.alert(alert_id)):
+            owner = row["owner"]
+        muted = self.db.muted_sellers(owner)
         fresh: list[Listing] = []
         for it in items:
             row = self.db.listing(alert_id, it.id)
@@ -124,7 +130,7 @@ class Scheduler:
             if key not in self.cap_warned:
                 self.cap_warned.add(key)
                 await self.out.text(f"🛑 «{cfg.name}» ha llegado al tope de llamadas de hoy; "
-                                    f"{len(fresh)} anuncios esperan a mañana (o sube max_llm_per_day con /editar).")
+                                    f"{len(fresh)} anuncios esperan a mañana (o sube max_llm_per_day con /editar).", alert_id)
             return  # not saved: they'll be judged when there's budget, if still listed
         fresh = fresh[:budget * BATCH]
         verdicts = await judge_batch(self.claude, cfg, fresh, alert_id)

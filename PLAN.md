@@ -1,7 +1,7 @@
 # wallmpop — plan
 
 Cazador de chollos en Wallapop. Uso personal (no nubuza). Corre en Docker en esta máquina.
-Un bot de Telegram dedicado gestiona las alertas y recibe los anuncios que encajan.
+Un bot de Telegram dedicado (privado, con acceso aprobado por el admin) gestiona las alertas y recibe los anuncios que encajan.
 
 ## Flujo
 
@@ -40,8 +40,10 @@ Se puede retocar con `/editar <alerta> <texto libre>` (Sonnet reescribe la confi
 
 ## Bot de Telegram (dedicado, solo tu chat_id)
 
-- **Control de acceso**: `ALLOWED_USER_IDS`; cualquier otro usuario se ignora (y se registra en el log).
-  Sin ids configurados, el bot solo responde diciendo tu id.
+- **Control de acceso**: `ALLOWED_USER_IDS` son los admins. Quien más escriba pide acceso: al admin le
+  llega "👤 … quiere usar el bot" con ✅ Permitir / ❌ Rechazar (una vez por persona). Cada usuario
+  tiene sus alertas, avisos y vendedores silenciados; tope `MAX_ALERTS_PER_USER`. `/usuarios` (admin)
+  lista y quita accesos (quitar pausa sus alertas). Sin admins configurados, el bot solo dice tu id.
 - **Aviso de desarrollador**: si la API de Wallapop falla 3 veces seguidas, cambia de formato
   (aviso inmediato) o devuelve 0 anuncios en todas las búsquedas mucho rato, llega
   "⚠️ Aviso de desarrollador" al chat, una sola vez, y "✅" cuando se recupera. `/estado` lo muestra.

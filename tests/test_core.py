@@ -92,7 +92,7 @@ class FakeOut:
     async def listing(self, alert_id, cfg, it, verdict, score, why, old_price=None):
         self.listings.append((it.id, verdict, old_price))
 
-    async def text(self, text):
+    async def text(self, text, alert_id=None):
         self.texts.append(text)
 
 
@@ -106,7 +106,7 @@ def test_process(monkeypatch):
     monkeypatch.setattr("wallmpop.scheduler.judge_batch", fake_judge)
     db, out = DB(":memory:"), FakeOut()
     c = cfg()
-    aid = db.add_alert(c)
+    aid = db.add_alert(c, 1)
     src = FakeSource([item("a"), item("b", title="otro 512gb"), item("c", price=99)])
     s = Scheduler(db, src, None, out)
     asyncio.run(s.run_alert(aid, c))
@@ -128,9 +128,57 @@ def test_cap(monkeypatch):
     monkeypatch.setattr("wallmpop.scheduler.judge_batch", boom)
     db, out = DB(":memory:"), FakeOut()
     c = cfg(max_llm_per_day=1)
-    aid = db.add_alert(c)
+    aid = db.add_alert(c, 1)
     db.add_usage("haiku", aid, 1, 1, 0)
     s = Scheduler(db, FakeSource([item("a")]), None, out)
     asyncio.run(s.run_alert(aid, c))
     asyncio.run(s.run_alert(aid, c))
     assert len(out.texts) == 1 and "tope" in out.texts[0]
+
+
+def test_users_and_owners():
+    db = DB(":memory:")
+    a1, a2 = db.add_alert(cfg(name="mine"), 1), db.add_alert(cfg(name="theirs"), 2)
+    assert [r["id"] for r in db.alerts(owner=1)] == [a1]
+    assert db.find_alert(str(a2), owner=1) is None and db.find_alert("theirs", owner=2)["id"] == a2
+    db.set_user(2, "pending", "Ana", "ana")
+    db.set_user(2, "allowed")
+    assert db.user(2)["status"] == "allowed" and db.user(2)["name"] == "Ana"
+    db.mute_seller(2, "s1")
+    assert db.muted_sellers(2) == {"s1"} and db.muted_sellers(1) == set()
+    db.pause_owner(2)
+    assert db.alert(a2)["paused"] == 1 and db.alert(a1)["paused"] == 0
+
+
+def test_gate():
+    from types import SimpleNamespace as NS
+
+    from telegram.ext import ApplicationHandlerStop
+
+    from wallmpop.bot import Bot
+    from wallmpop.config import Settings
+
+    sent, replies = [], []
+
+    class FakeBot:
+        async def send_message(self, uid, text, **kw):
+            sent.append((uid, text))
+
+    async def reply(text, **kw):
+        replies.append(text)
+
+    b = Bot(Settings(telegram_token="1:x", allowed_user_ids={1}), DB(":memory:"), None)
+    b.app = NS(bot=FakeBot())
+
+    def upd(uid):
+        return NS(effective_user=NS(id=uid, full_name="Eve", username="eve"), callback_query=None,
+                  effective_message=NS(text="/start", reply_text=reply))
+
+    asyncio.run(b.gate(upd(1), None))  # admin passes
+    for _ in range(2):
+        with pytest.raises(ApplicationHandlerStop):
+            asyncio.run(b.gate(upd(7), None))
+    assert len(sent) == 1 and sent[0][0] == 1 and "quiere usar" in sent[0][1]  # admin asked once
+    assert "pendiente" in replies[-1]
+    b.db.set_user(7, "allowed")
+    asyncio.run(b.gate(upd(7), None))  # now passes

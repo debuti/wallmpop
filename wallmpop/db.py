@@ -32,7 +32,12 @@ CREATE TABLE IF NOT EXISTS feedback (
   alert_id INTEGER, item_id TEXT, vote INTEGER, ts INTEGER,
   PRIMARY KEY (alert_id, item_id)
 );
-CREATE TABLE IF NOT EXISTS muted_sellers (seller_id TEXT PRIMARY KEY, ts INTEGER);
+CREATE TABLE IF NOT EXISTS mutes (user_id INTEGER, seller_id TEXT, ts INTEGER, PRIMARY KEY (user_id, seller_id));
+CREATE TABLE IF NOT EXISTS users (
+  user_id INTEGER PRIMARY KEY, name TEXT, username TEXT,
+  status TEXT NOT NULL,  -- pending | allowed | denied
+  ts INTEGER
+);
 CREATE TABLE IF NOT EXISTS usage (
   day TEXT, model TEXT, alert_id INTEGER, calls INTEGER, input_tokens INTEGER,
   output_tokens INTEGER, cost_usd REAL,
@@ -48,12 +53,20 @@ class DB:
         self.c = sqlite3.connect(path, check_same_thread=False)
         self.c.row_factory = sqlite3.Row
         self.c.executescript(SCHEMA)
+        cols = {r[1] for r in self.c.execute("PRAGMA table_info(alerts)")}
+        if "owner" not in cols:
+            self.c.execute("ALTER TABLE alerts ADD COLUMN owner INTEGER")
+        self.c.commit()
+
+    def claim_unowned(self, owner: int) -> None:
+        """Alerts from before multi-user belong to the first admin."""
+        self.c.execute("UPDATE alerts SET owner=? WHERE owner IS NULL", (owner,))
         self.c.commit()
 
     # alerts
-    def add_alert(self, cfg: AlertConfig) -> int:
-        cur = self.c.execute("INSERT INTO alerts(config, created_at) VALUES (?, ?)",
-                             (json.dumps(cfg.to_dict(), ensure_ascii=False), int(time.time())))
+    def add_alert(self, cfg: AlertConfig, owner: int) -> int:
+        cur = self.c.execute("INSERT INTO alerts(config, created_at, owner) VALUES (?, ?, ?)",
+                             (json.dumps(cfg.to_dict(), ensure_ascii=False), int(time.time()), owner))
         self.c.commit()
         return cur.lastrowid
 
@@ -62,18 +75,23 @@ class DB:
                        (json.dumps(cfg.to_dict(), ensure_ascii=False), alert_id))
         self.c.commit()
 
-    def alerts(self, include_paused: bool = True) -> list[sqlite3.Row]:
-        q = "SELECT * FROM alerts" + ("" if include_paused else " WHERE paused=0") + " ORDER BY id"
-        return self.c.execute(q).fetchall()
+    def alerts(self, include_paused: bool = True, owner: int | None = None) -> list[sqlite3.Row]:
+        q, args = "SELECT * FROM alerts WHERE 1=1", []
+        if not include_paused:
+            q += " AND paused=0"
+        if owner is not None:
+            q += " AND owner=?"; args.append(owner)
+        return self.c.execute(q + " ORDER BY id", args).fetchall()
 
     def alert(self, alert_id: int) -> sqlite3.Row | None:
         return self.c.execute("SELECT * FROM alerts WHERE id=?", (alert_id,)).fetchone()
 
-    def find_alert(self, ref: str) -> sqlite3.Row | None:
+    def find_alert(self, ref: str, owner: int | None = None) -> sqlite3.Row | None:
         ref = ref.strip()
         if ref.isdigit():
-            return self.alert(int(ref))
-        for row in self.alerts():
+            row = self.alert(int(ref))
+            return row if row and (owner is None or row["owner"] == owner) else None
+        for row in self.alerts(owner=owner):
             if json.loads(row["config"])["name"].lower() == ref.lower():
                 return row
         return None
@@ -140,12 +158,30 @@ class DB:
                JOIN listings l ON l.alert_id=f.alert_id AND l.item_id=f.item_id
                WHERE f.alert_id=? ORDER BY f.ts DESC LIMIT ?""", (alert_id, limit)).fetchall()
 
-    def mute_seller(self, seller_id: str) -> None:
-        self.c.execute("INSERT OR IGNORE INTO muted_sellers VALUES (?,?)", (seller_id, int(time.time())))
+    def mute_seller(self, user_id: int, seller_id: str) -> None:
+        self.c.execute("INSERT OR IGNORE INTO mutes VALUES (?,?,?)", (user_id, seller_id, int(time.time())))
         self.c.commit()
 
-    def muted_sellers(self) -> set[str]:
-        return {r[0] for r in self.c.execute("SELECT seller_id FROM muted_sellers")}
+    def muted_sellers(self, user_id: int | None) -> set[str]:
+        return {r[0] for r in self.c.execute("SELECT seller_id FROM mutes WHERE user_id=?", (user_id,))}
+
+    # users (admins come from the environment; everyone else asks for access)
+    def user(self, user_id: int) -> sqlite3.Row | None:
+        return self.c.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
+
+    def set_user(self, user_id: int, status: str, name: str | None = None, username: str | None = None) -> None:
+        self.c.execute(
+            """INSERT INTO users VALUES (?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET status=excluded.status,
+               name=COALESCE(excluded.name, name), username=COALESCE(excluded.username, username), ts=excluded.ts""",
+            (user_id, name, username, status, int(time.time())))
+        self.c.commit()
+
+    def users(self) -> list[sqlite3.Row]:
+        return self.c.execute("SELECT * FROM users ORDER BY status, ts").fetchall()
+
+    def pause_owner(self, owner: int) -> None:
+        self.c.execute("UPDATE alerts SET paused=1 WHERE owner=?", (owner,))
+        self.c.commit()
 
     # usage
     def add_usage(self, model: str, alert_id: int, input_tokens: int, output_tokens: int, cost: float) -> None:
@@ -156,6 +192,11 @@ class DB:
                  output_tokens=output_tokens+excluded.output_tokens, cost_usd=cost_usd+excluded.cost_usd""",
             (date.today().isoformat(), model, alert_id, input_tokens, output_tokens, cost))
         self.c.commit()
+
+    def calls_today_owner(self, owner: int) -> int:
+        return self.c.execute(
+            """SELECT COALESCE(SUM(u.calls),0) FROM usage u JOIN alerts a ON a.id=u.alert_id
+               WHERE u.day=? AND a.owner=?""", (date.today().isoformat(), owner)).fetchone()[0]
 
     def calls_today(self, alert_id: int | None = None, model: str | None = None) -> int:
         q, args = "SELECT COALESCE(SUM(calls),0) FROM usage WHERE day=?", [date.today().isoformat()]
