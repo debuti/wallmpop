@@ -1,6 +1,7 @@
 """Telegram bot: manages alerts and delivers matching listings. Only ALLOWED_USER_IDS may use it."""
 from __future__ import annotations
 
+import asyncio
 import difflib
 import html
 import json
@@ -340,7 +341,7 @@ class Bot:
     def build(self, sched_factory) -> Application:
         async def post_init(app: Application) -> None:
             self.sched = sched_factory(self)
-            app.create_task(self.sched.loop())
+            self._loop_task = asyncio.create_task(self.sched.loop())
             await app.bot.set_my_commands([BotCommand(c, d) for c, d in COMMANDS])
             log.info("bot ready; allowed users: %s", sorted(self.s.allowed_user_ids))
 
