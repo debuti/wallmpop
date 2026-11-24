@@ -1,0 +1,2 @@
+# Keeps the bot always up: the Telegram bot runs this at start, after reboots and every 5 min.
+./run.sh
